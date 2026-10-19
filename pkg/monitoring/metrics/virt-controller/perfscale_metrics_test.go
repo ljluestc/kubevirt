@@ -22,6 +22,7 @@ package virtcontroller
 import (
 	"time"
 
+	k8sv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -81,6 +82,82 @@ var _ = Describe("VMI phase transition time histogram", func() {
 			Entry("Time spent deleting a VMI that exited in a failed state", 5.0, v1.Failed, v1.Running, false),
 			Entry("Time spent deleting a VMI that exited in a succeeded state", 5.0, v1.Succeeded, v1.Running, false),
 		)
+	})
+
+	Context("Guest agent connected time from running calculations", func() {
+		const bootSeconds = 7.5
+
+		newRunningVMI := func() *v1.VirtualMachineInstance {
+			return createVMISForPhaseTransitionTime(v1.Running, v1.Scheduled, 1000, true)
+		}
+
+		withAgentConnected := func(vmi *v1.VirtualMachineInstance, after time.Duration) *v1.VirtualMachineInstance {
+			running := vmi.Status.PhaseTransitionTimestamps[0].PhaseTransitionTimestamp
+			vmi = vmi.DeepCopy()
+			vmi.Status.Conditions = append(vmi.Status.Conditions, v1.VirtualMachineInstanceCondition{
+				Type:          v1.VirtualMachineInstanceAgentConnected,
+				Status:        k8sv1.ConditionTrue,
+				LastProbeTime: metav1.NewTime(running.Add(after)),
+			})
+			return vmi
+		}
+
+		It("should measure the time from Running until the agent first connects", func() {
+			oldVMI := newRunningVMI()
+			newVMI := withAgentConnected(oldVMI, time.Duration(bootSeconds*float64(time.Second)))
+
+			diffSeconds, err := getVMIAgentConnectedTimeFromRunningSeconds(oldVMI, newVMI)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(diffSeconds).ToNot(BeNil())
+			Expect(*diffSeconds).To(Equal(bootSeconds))
+		})
+
+		DescribeTable("should not measure", func(mutate func(oldVMI, newVMI *v1.VirtualMachineInstance) (*v1.VirtualMachineInstance, *v1.VirtualMachineInstance)) {
+			oldVMI := newRunningVMI()
+			newVMI := withAgentConnected(oldVMI, 5*time.Second)
+			oldVMI, newVMI = mutate(oldVMI, newVMI)
+
+			diffSeconds, err := getVMIAgentConnectedTimeFromRunningSeconds(oldVMI, newVMI)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(diffSeconds).To(BeNil())
+		},
+			Entry("when the agent is not connected", func(oldVMI, _ *v1.VirtualMachineInstance) (*v1.VirtualMachineInstance, *v1.VirtualMachineInstance) {
+				return oldVMI, oldVMI.DeepCopy()
+			}),
+			Entry("when the agent was already connected", func(_, newVMI *v1.VirtualMachineInstance) (*v1.VirtualMachineInstance, *v1.VirtualMachineInstance) {
+				return newVMI.DeepCopy(), newVMI
+			}),
+			Entry("when the agent reconnects after a guest reboot", func(oldVMI, newVMI *v1.VirtualMachineInstance) (*v1.VirtualMachineInstance, *v1.VirtualMachineInstance) {
+				oldVMI.Status.GuestOSInfo.Name = "Fedora Linux"
+				newVMI.Status.GuestOSInfo.Name = "Fedora Linux"
+				return oldVMI, newVMI
+			}),
+			Entry("when the VMI is not running", func(oldVMI, newVMI *v1.VirtualMachineInstance) (*v1.VirtualMachineInstance, *v1.VirtualMachineInstance) {
+				newVMI.Status.Phase = v1.Failed
+				return oldVMI, newVMI
+			}),
+			Entry("when there is no old VMI", func(_, newVMI *v1.VirtualMachineInstance) (*v1.VirtualMachineInstance, *v1.VirtualMachineInstance) {
+				return nil, newVMI
+			}),
+		)
+
+		It("should fail when the Running transition timestamp is missing", func() {
+			oldVMI := newRunningVMI()
+			newVMI := withAgentConnected(oldVMI, 5*time.Second)
+			newVMI.Status.PhaseTransitionTimestamps = nil
+
+			_, err := getVMIAgentConnectedTimeFromRunningSeconds(oldVMI, newVMI)
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("should fail when the agent condition has no probe time", func() {
+			oldVMI := newRunningVMI()
+			newVMI := withAgentConnected(oldVMI, 5*time.Second)
+			newVMI.Status.Conditions[0].LastProbeTime = metav1.Time{}
+
+			_, err := getVMIAgentConnectedTimeFromRunningSeconds(oldVMI, newVMI)
+			Expect(err).To(HaveOccurred())
+		})
 	})
 })
 

@@ -23,6 +23,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rhobs/operator-observability-toolkit/pkg/operatormetrics"
+	k8sv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/cache"
 
@@ -40,6 +41,7 @@ var (
 		vmiPhaseTransition,
 		vmiPhaseTransitionTimeFromCreation,
 		vmiPhaseTransitionFromDeletion,
+		vmiAgentConnectedTimeFromRunning,
 	}
 
 	vmiPhaseTransition = operatormetrics.NewHistogramVec(
@@ -85,6 +87,17 @@ var (
 			"phase",
 		},
 	)
+
+	vmiAgentConnectedTimeFromRunning = operatormetrics.NewHistogram(
+		operatormetrics.MetricOpts{
+			Name: "kubevirt_vmi_agent_connected_time_from_running_seconds",
+			Help: "Histogram of the duration from the VMI entering the Running phase until the guest agent first connects, in seconds. " +
+				"Approximates guest boot time (firmware, bootloader, kernel and init) for VMIs running a guest agent.",
+		},
+		prometheus.HistogramOpts{
+			Buckets: PhaseTransitionTimeBuckets(),
+		},
+	)
 )
 
 func AddVMIPhaseTransitionHandlers(informer cache.SharedIndexInformer) error {
@@ -99,6 +112,11 @@ func AddVMIPhaseTransitionHandlers(informer cache.SharedIndexInformer) error {
 	}
 
 	err = addVMIPhaseTransitionTimeFromDeletionHandler(informer)
+	if err != nil {
+		return err
+	}
+
+	err = addVMIAgentConnectedTimeFromRunningHandler(informer)
 	if err != nil {
 		return err
 	}
@@ -130,6 +148,15 @@ func addVMIPhaseTransitionTimeFromDeletionHandler(informer cache.SharedIndexInfo
 			// User is deleting a VM. Record the time from the
 			// deletionTimestamp to when the VMI enters the final phase
 			updateVMIPhaseTransitionTimeFromDeletionTime(oldVMI.(*v1.VirtualMachineInstance), newVMI.(*v1.VirtualMachineInstance))
+		},
+	})
+	return err
+}
+
+func addVMIAgentConnectedTimeFromRunningHandler(informer cache.SharedIndexInformer) error {
+	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		UpdateFunc: func(oldVMI, newVMI interface{}) {
+			updateVMIAgentConnectedTimeFromRunning(oldVMI.(*v1.VirtualMachineInstance), newVMI.(*v1.VirtualMachineInstance))
 		},
 	})
 	return err
@@ -200,6 +227,67 @@ func updateVMIPhaseTransitionTimeFromDeletionTime(oldVMI, newVMI *v1.VirtualMach
 	}
 
 	histogram.Observe(diffSeconds)
+}
+
+func updateVMIAgentConnectedTimeFromRunning(oldVMI, newVMI *v1.VirtualMachineInstance) {
+	diffSeconds, err := getVMIAgentConnectedTimeFromRunningSeconds(oldVMI, newVMI)
+	if err != nil {
+		log.Log.V(logVerbosityDebug).Infof(transTimeErrFmt, err)
+		return
+	}
+	if diffSeconds == nil {
+		return
+	}
+
+	vmiAgentConnectedTimeFromRunning.Observe(*diffSeconds)
+}
+
+// getVMIAgentConnectedTimeFromRunningSeconds returns the time between the VMI
+// entering the Running phase and the guest agent connecting for the first time.
+// It returns nil when the update is not a first connection: the guest OS info,
+// which is only reported by the agent and never cleared, is used to skip
+// reconnections after guest reboots or migrations.
+func getVMIAgentConnectedTimeFromRunningSeconds(oldVMI, newVMI *v1.VirtualMachineInstance) (*float64, error) {
+	if oldVMI == nil || newVMI.Status.Phase != v1.Running || oldVMI.Status.GuestOSInfo.Name != "" {
+		return nil, nil
+	}
+
+	if getAgentConnectedCondition(oldVMI) != nil {
+		return nil, nil
+	}
+	agentCondition := getAgentConnectedCondition(newVMI)
+	if agentCondition == nil {
+		return nil, nil
+	}
+
+	var runningTime *metav1.Time
+	for _, transitionTimestamp := range newVMI.Status.PhaseTransitionTimestamps {
+		if transitionTimestamp.Phase == v1.Running {
+			runningTime = transitionTimestamp.PhaseTransitionTimestamp.DeepCopy()
+			break
+		}
+	}
+
+	var connectedTime *metav1.Time
+	if !agentCondition.LastProbeTime.IsZero() {
+		connectedTime = agentCondition.LastProbeTime.DeepCopy()
+	}
+
+	diffSeconds, err := getTransitionTimeSeconds(runningTime, connectedTime)
+	if err != nil {
+		return nil, err
+	}
+	return &diffSeconds, nil
+}
+
+func getAgentConnectedCondition(vmi *v1.VirtualMachineInstance) *v1.VirtualMachineInstanceCondition {
+	for i := range vmi.Status.Conditions {
+		cond := &vmi.Status.Conditions[i]
+		if cond.Type == v1.VirtualMachineInstanceAgentConnected && cond.Status == k8sv1.ConditionTrue {
+			return cond
+		}
+	}
+	return nil
 }
 
 func getOldTime(fromCreation, fromDeletion bool, oldVMI, newVMI *v1.VirtualMachineInstance) (*metav1.Time, error) {
